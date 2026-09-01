@@ -167,6 +167,35 @@ func (q *Queries) GetUserByLogin(ctx context.Context, arg GetUserByLoginParams) 
 	return i, err
 }
 
+const getUserByPhone = `-- name: GetUserByPhone :one
+SELECT id, project_id, email, username, phone, password_hash, email_verified, phone_verified, banned, metadata, created_at, updated_at FROM users WHERE project_id = $1 AND phone = $2
+`
+
+type GetUserByPhoneParams struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	Phone     *string   `json:"phone"`
+}
+
+func (q *Queries) GetUserByPhone(ctx context.Context, arg GetUserByPhoneParams) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByPhone, arg.ProjectID, arg.Phone)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.Email,
+		&i.Username,
+		&i.Phone,
+		&i.PasswordHash,
+		&i.EmailVerified,
+		&i.PhoneVerified,
+		&i.Banned,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const setUserBanned = `-- name: SetUserBanned :exec
 UPDATE users SET banned = $2 WHERE id = $1 AND project_id = $3
 `
@@ -202,5 +231,14 @@ type SetUserPasswordHashParams struct {
 
 func (q *Queries) SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) error {
 	_, err := q.db.Exec(ctx, setUserPasswordHash, arg.ID, arg.PasswordHash)
+	return err
+}
+
+const setUserPhoneVerified = `-- name: SetUserPhoneVerified :exec
+UPDATE users SET phone_verified = true WHERE id = $1
+`
+
+func (q *Queries) SetUserPhoneVerified(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, setUserPhoneVerified, id)
 	return err
 }

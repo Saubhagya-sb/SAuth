@@ -88,6 +88,16 @@ func NewRefreshToken() (raw, hash string, err error) {
 	return raw, HashRefreshToken(raw), nil
 }
 
+// RandomToken returns a URL-safe base64 string carrying nBytes of entropy.
+// Used for opaque values like the OAuth `state` and the post-callback auth_code.
+func RandomToken(nBytes int) (string, error) {
+	b := make([]byte, nBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 // HashRefreshToken is the deterministic hash used for refresh-token lookups.
 // SHA-256 is appropriate here (unlike passwords) because the input is
 // full-entropy random — no need for a slow KDF, and we want O(1) index lookups.

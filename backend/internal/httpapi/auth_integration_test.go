@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -14,8 +16,29 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/saubhagyabhadhouria/sauth/internal/config"
+	"github.com/saubhagyabhadhouria/sauth/internal/googleoauth"
+	"github.com/saubhagyabhadhouria/sauth/internal/notify"
 	"github.com/saubhagyabhadhouria/sauth/internal/password"
+	"github.com/saubhagyabhadhouria/sauth/internal/secretbox"
 )
+
+// fakeGoogle stands in for the real Google provider in tests.
+type fakeGoogle struct {
+	identity *googleoauth.Identity
+}
+
+func (f *fakeGoogle) AuthCodeURL(_ googleoauth.Config, state string) string {
+	return "https://accounts.google.test/o/oauth2/v2/auth?state=" + url.QueryEscape(state)
+}
+
+func (f *fakeGoogle) Exchange(_ context.Context, _ googleoauth.Config, code string) (*googleoauth.Identity, error) {
+	if code == "" || f.identity == nil {
+		return nil, errors.New("bad code")
+	}
+	return f.identity, nil
+}
+
+var testEncKey = []byte("0123456789abcdef0123456789abcdef") // 32 bytes
 
 // These tests need a reachable Postgres with the SAuth schema already migrated.
 // Point SAUTH_TEST_DATABASE_URL at it (falls back to SAUTH_DATABASE_URL). Each
@@ -69,22 +92,47 @@ func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	}
 }
 
-func newTestServer(t *testing.T, pool *pgxpool.Pool) *httptest.Server {
+func newTestServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *notify.RecordingSender, *fakeGoogle) {
 	t.Helper()
 	cfg := &config.Config{
 		JWTSecret:       []byte("integration-test-secret-at-least-32b!"),
 		JWTIssuer:       "sauth-itest",
+		PublicBaseURL:   "http://sauth.test",
 		AccessTokenTTL:  15 * time.Minute,
 		RefreshTokenTTL: 24 * time.Hour,
+		EncryptionKey:   testEncKey,
 	}
-	srv := httptest.NewServer(NewServer(pool, cfg).Routes())
+	rec := notify.NewRecordingSender()
+	fg := &fakeGoogle{}
+	srv := httptest.NewServer(NewServer(pool, cfg, WithOTPSender(rec), WithGoogleOAuth(fg)).Routes())
+	srv.Client().CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, rec, fg
+}
+
+// enableGoogle configures a project row with encrypted Google credentials and an
+// allowed origin so the OAuth start check passes.
+func enableGoogle(t *testing.T, pool *pgxpool.Pool, projectID, allowedOrigin string) {
+	t.Helper()
+	box, err := secretbox.New(testEncKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := box.Seal("test-google-client-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, pool, `UPDATE projects
+		SET google_oauth_client_id = 'test-client-id.apps.googleusercontent.com',
+		    google_oauth_client_secret_enc = $2,
+		    allowed_origins = ARRAY[$3::text]
+		WHERE id = $1`, projectID, enc, allowedOrigin)
 }
 
 type apiResp struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	OTPID        string `json:"otp_id"`
 	User         struct {
 		ID    string   `json:"id"`
 		Email *string  `json:"email"`
@@ -121,7 +169,7 @@ func do(t *testing.T, srv *httptest.Server, method, path, apiKey, bearer, body s
 func TestPasswordAuthFlow(t *testing.T) {
 	pool := testPool(t)
 	_, apiKey := provisionProject(t, pool)
-	srv := newTestServer(t, pool)
+	srv, _, _ := newTestServer(t, pool)
 
 	email := "flow-" + uuid.NewString() + "@example.com"
 
@@ -180,7 +228,7 @@ func TestPasswordAuthFlow(t *testing.T) {
 func TestLogoutInvalidatesRefresh(t *testing.T) {
 	pool := testPool(t)
 	_, apiKey := provisionProject(t, pool)
-	srv := newTestServer(t, pool)
+	srv, _, _ := newTestServer(t, pool)
 
 	email := "logout-" + uuid.NewString() + "@example.com"
 	_, r := do(t, srv, "POST", "/v1/auth/signup", apiKey, "", `{"email":"`+email+`","password":"supersecret1"}`)
@@ -194,9 +242,185 @@ func TestLogoutInvalidatesRefresh(t *testing.T) {
 	}
 }
 
+func TestOTPSignupThenLogin(t *testing.T) {
+	pool := testPool(t)
+	_, apiKey := provisionProject(t, pool)
+	srv, rec, _ := newTestServer(t, pool)
+
+	email := "otp-" + uuid.NewString() + "@example.com"
+
+	// request signup OTP
+	code, r := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"`+email+`","purpose":"signup"}`)
+	if code != http.StatusOK || r.OTPID == "" {
+		t.Fatalf("otp request: want 200 with otp_id, got %d/%s", code, r.Error.Code)
+	}
+	sent := rec.Code(email)
+	if sent == "" {
+		t.Fatal("expected a code to be delivered for a new signup")
+	}
+
+	// wrong code -> 401 otp_invalid
+	if c, rr := do(t, srv, "POST", "/v1/auth/otp/verify", apiKey, "",
+		`{"otp_id":"`+r.OTPID+`","code":"000000"}`); c != http.StatusUnauthorized || rr.Error.Code != "otp_invalid" {
+		t.Fatalf("wrong code: want 401/otp_invalid, got %d/%s", c, rr.Error.Code)
+	}
+
+	// correct code -> account created + tokens
+	c, rr := do(t, srv, "POST", "/v1/auth/otp/verify", apiKey, "",
+		`{"otp_id":"`+r.OTPID+`","code":"`+sent+`"}`)
+	if c != http.StatusOK || rr.AccessToken == "" || rr.User.Email == nil || *rr.User.Email != email {
+		t.Fatalf("verify signup: want 200 with tokens+user, got %d/%s", c, rr.Error.Code)
+	}
+	if len(rr.User.Roles) != 1 || rr.User.Roles[0] != "member" {
+		t.Fatalf("verify signup: default role missing: %v", rr.User.Roles)
+	}
+
+	// now log in via OTP
+	_, r2 := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"`+email+`","purpose":"login"}`)
+	if r2.OTPID == "" || rec.Code(email) == "" {
+		t.Fatal("login otp: expected code delivered to existing user")
+	}
+	if c, rr := do(t, srv, "POST", "/v1/auth/otp/verify", apiKey, "",
+		`{"otp_id":"`+r2.OTPID+`","code":"`+rec.Code(email)+`"}`); c != http.StatusOK || rr.AccessToken == "" {
+		t.Fatalf("verify login: want 200 with tokens, got %d/%s", c, rr.Error.Code)
+	}
+
+	// login OTP for an unknown address: still 200 + otp_id, but nothing sent
+	unknown := "ghost-" + uuid.NewString() + "@example.com"
+	c, r3 := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"`+unknown+`","purpose":"login"}`)
+	if c != http.StatusOK || r3.OTPID == "" {
+		t.Fatalf("unknown-user otp request: want uniform 200, got %d", c)
+	}
+	if rec.Code(unknown) != "" {
+		t.Fatal("no code should be delivered for an unknown login address")
+	}
+}
+
+func TestOTPThrottleAndDisabled(t *testing.T) {
+	pool := testPool(t)
+	projectID, apiKey := provisionProject(t, pool)
+	srv, _, _ := newTestServer(t, pool)
+
+	email := "throttle-" + uuid.NewString() + "@example.com"
+	if c, _ := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"`+email+`","purpose":"signup"}`); c != http.StatusOK {
+		t.Fatalf("first request: want 200, got %d", c)
+	}
+	if c, rr := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"`+email+`","purpose":"signup"}`); c != http.StatusTooManyRequests || rr.Error.Code != "rate_limited" {
+		t.Fatalf("immediate resend: want 429/rate_limited, got %d/%s", c, rr.Error.Code)
+	}
+
+	mustExec(t, pool, `UPDATE projects SET otp_enabled = false WHERE id = $1`, projectID)
+	if c, rr := do(t, srv, "POST", "/v1/auth/otp/request", apiKey, "",
+		`{"email_or_phone":"new-`+email+`","purpose":"signup"}`); c != http.StatusForbidden || rr.Error.Code != "otp_disabled" {
+		t.Fatalf("otp disabled: want 403/otp_disabled, got %d/%s", c, rr.Error.Code)
+	}
+}
+
+// getLocation issues a GET without following redirects and returns the status
+// and Location header.
+func getLocation(t *testing.T, srv *httptest.Server, path string) (int, string) {
+	t.Helper()
+	resp, err := srv.Client().Get(srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Location")
+}
+
+func TestGoogleOAuthFlow(t *testing.T) {
+	pool := testPool(t)
+	projectID, apiKey := provisionProject(t, pool)
+	srv, _, fg := newTestServer(t, pool)
+
+	const appOrigin = "http://localhost:3000"
+	enableGoogle(t, pool, projectID, appOrigin)
+	fg.identity = &googleoauth.Identity{
+		Sub:           "google-sub-" + uuid.NewString(),
+		Email:         "guser-" + uuid.NewString() + "@example.com",
+		EmailVerified: true,
+		Name:          "G User",
+	}
+
+	// start -> 302 to Google with a state param
+	code, loc := getLocation(t, srv, "/v1/auth/oauth/google/start?api_key="+apiKey+"&redirect_uri="+url.QueryEscape(appOrigin+"/cb"))
+	if code != http.StatusFound {
+		t.Fatalf("start: want 302, got %d", code)
+	}
+	gu, _ := url.Parse(loc)
+	state := gu.Query().Get("state")
+	if state == "" || gu.Host != "accounts.google.test" {
+		t.Fatalf("start: unexpected authorize URL %q", loc)
+	}
+
+	// disallowed redirect origin -> 403
+	if c, _ := getLocation(t, srv, "/v1/auth/oauth/google/start?api_key="+apiKey+"&redirect_uri="+url.QueryEscape("https://evil.example/cb")); c != http.StatusForbidden {
+		t.Fatalf("start bad origin: want 403, got %d", c)
+	}
+
+	// callback -> 302 back to the app with an auth_code
+	code, loc = getLocation(t, srv, "/v1/auth/oauth/google/callback?code=good&state="+url.QueryEscape(state))
+	if code != http.StatusFound {
+		t.Fatalf("callback: want 302, got %d", code)
+	}
+	cb, _ := url.Parse(loc)
+	if cb.Scheme+"://"+cb.Host+cb.Path != appOrigin+"/cb" {
+		t.Fatalf("callback: redirected to %q, want %s/cb", loc, appOrigin)
+	}
+	authCode := cb.Query().Get("auth_code")
+	if authCode == "" {
+		t.Fatalf("callback: no auth_code in %q", loc)
+	}
+
+	// exchange -> 200 with tokens for the Google user
+	c, rr := do(t, srv, "POST", "/v1/auth/oauth/exchange", apiKey, "", `{"auth_code":"`+authCode+`"}`)
+	if c != http.StatusOK || rr.AccessToken == "" || rr.User.Email == nil || *rr.User.Email != fg.identity.Email {
+		t.Fatalf("exchange: want 200 with tokens+user, got %d/%s", c, rr.Error.Code)
+	}
+	if len(rr.User.Roles) != 1 || rr.User.Roles[0] != "member" {
+		t.Fatalf("exchange: default role missing: %v", rr.User.Roles)
+	}
+
+	// auth_code is single-use
+	if c, rr := do(t, srv, "POST", "/v1/auth/oauth/exchange", apiKey, "", `{"auth_code":"`+authCode+`"}`); c != http.StatusUnauthorized || rr.Error.Code != "auth_code_invalid" {
+		t.Fatalf("exchange reuse: want 401/auth_code_invalid, got %d/%s", c, rr.Error.Code)
+	}
+
+	// state is single-use
+	if c, l := getLocation(t, srv, "/v1/auth/oauth/google/callback?code=good&state="+url.QueryEscape(state)); c != http.StatusBadRequest {
+		t.Fatalf("callback state reuse: want 400, got %d (loc %q)", c, l)
+	}
+
+	// second sign-in with the same Google account resolves to the same user
+	code, loc = getLocation(t, srv, "/v1/auth/oauth/google/start?api_key="+apiKey+"&redirect_uri="+url.QueryEscape(appOrigin+"/cb"))
+	gu, _ = url.Parse(loc)
+	code, loc = getLocation(t, srv, "/v1/auth/oauth/google/callback?code=good&state="+url.QueryEscape(gu.Query().Get("state")))
+	cb, _ = url.Parse(loc)
+	c, rr2 := do(t, srv, "POST", "/v1/auth/oauth/exchange", apiKey, "", `{"auth_code":"`+cb.Query().Get("auth_code")+`"}`)
+	if c != http.StatusOK || rr2.User.ID != rr.User.ID {
+		t.Fatalf("second sign-in: want same user %s, got %s (status %d)", rr.User.ID, rr2.User.ID, c)
+	}
+}
+
+func TestOAuthNotConfigured(t *testing.T) {
+	pool := testPool(t)
+	_, apiKey := provisionProject(t, pool)
+	srv, _, _ := newTestServer(t, pool)
+
+	c, _ := getLocation(t, srv, "/v1/auth/oauth/google/start?api_key="+apiKey+"&redirect_uri="+url.QueryEscape("http://localhost:3000/cb"))
+	if c != http.StatusBadRequest {
+		t.Fatalf("start without google creds: want 400, got %d", c)
+	}
+}
+
 func TestRequireProject(t *testing.T) {
 	pool := testPool(t)
-	srv := newTestServer(t, pool)
+	srv, _, _ := newTestServer(t, pool)
 
 	if code, _ := do(t, srv, "POST", "/v1/auth/login", "", "", `{}`); code != http.StatusUnauthorized {
 		t.Fatalf("missing api key: want 401, got %d", code)

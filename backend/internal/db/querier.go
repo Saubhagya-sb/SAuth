@@ -8,18 +8,33 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
 	// project_id is carried explicitly so the composite FKs enforce that the user
 	// and role belong to the same project.
 	AssignRoleToUser(ctx context.Context, arg AssignRoleToUserParams) error
+	ConsumeOTP(ctx context.Context, id uuid.UUID) error
+	CreateAuthExchangeCode(ctx context.Context, arg CreateAuthExchangeCodeParams) error
+	CreateOAuthAccount(ctx context.Context, arg CreateOAuthAccountParams) (OauthAccount, error)
+	CreateOAuthState(ctx context.Context, arg CreateOAuthStateParams) error
+	// user_id is left NULL at creation; the account is resolved (login) or created
+	// (signup) at verify time from `destination`.
+	CreateOTP(ctx context.Context, arg CreateOTPParams) (OtpCode, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	DeleteExpiredAuthExchangeCodes(ctx context.Context) error
+	DeleteExpiredOAuthStates(ctx context.Context) error
+	DeleteExpiredOTPs(ctx context.Context) error
 	DeleteExpiredSessions(ctx context.Context) error
 	// A hit here means a rotated-away token was replayed -> reuse detected.
 	FindSessionByUsedRefreshHash(ctx context.Context, tokenHash string) (uuid.UUID, error)
 	GetDefaultRole(ctx context.Context, projectID uuid.UUID) (Role, error)
+	// Resend throttle.
+	GetLatestOTPCreatedAt(ctx context.Context, arg GetLatestOTPCreatedAtParams) (pgtype.Timestamptz, error)
+	GetOAuthAccount(ctx context.Context, arg GetOAuthAccountParams) (OauthAccount, error)
+	GetOTPByID(ctx context.Context, id uuid.UUID) (OtpCode, error)
 	// Hottest lookup in the system: every end-user request resolves its project
 	// from the X-API-Key header before anything else.
 	GetProjectByAPIKey(ctx context.Context, apiKey string) (Project, error)
@@ -33,9 +48,14 @@ type Querier interface {
 	GetUserByIDOnly(ctx context.Context, id uuid.UUID) (User, error)
 	// Resolves the /auth/login "email_or_username" field within a project.
 	GetUserByLogin(ctx context.Context, arg GetUserByLoginParams) (User, error)
+	GetUserByPhone(ctx context.Context, arg GetUserByPhoneParams) (User, error)
 	// Flattened permission list for the access-token "permissions" claim.
 	GetUserPermissionNames(ctx context.Context, userID uuid.UUID) ([]string, error)
 	GetUserRoleNames(ctx context.Context, userID uuid.UUID) ([]string, error)
+	IncrementOTPAttempts(ctx context.Context, id uuid.UUID) (int16, error)
+	// Burn any earlier un-consumed codes for this destination+purpose before a new
+	// one is issued, so only the most recent code can ever verify.
+	InvalidateActiveOTPs(ctx context.Context, arg InvalidateActiveOTPsParams) error
 	// Called on every rotation with the outgoing hash.
 	RecordUsedRefreshHash(ctx context.Context, arg RecordUsedRefreshHashParams) error
 	RemoveRoleFromUser(ctx context.Context, arg RemoveRoleFromUserParams) error
@@ -46,6 +66,11 @@ type Querier interface {
 	SetUserBanned(ctx context.Context, arg SetUserBannedParams) error
 	SetUserEmailVerified(ctx context.Context, id uuid.UUID) error
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) error
+	SetUserPhoneVerified(ctx context.Context, id uuid.UUID) error
+	// Atomically consume: only an unexpired, unconsumed code for this project returns.
+	TakeAuthExchangeCode(ctx context.Context, arg TakeAuthExchangeCodeParams) (AuthExchangeCode, error)
+	// Single-use: the row is deleted as it's read.
+	TakeOAuthState(ctx context.Context, state string) (OauthState, error)
 }
 
 var _ Querier = (*Queries)(nil)

@@ -13,6 +13,9 @@ SELECT * FROM users WHERE id = $1;
 -- name: GetUserByEmail :one
 SELECT * FROM users WHERE project_id = $1 AND email = $2;
 
+-- name: GetUserByPhone :one
+SELECT * FROM users WHERE project_id = $1 AND phone = $2;
+
 -- name: GetUserByLogin :one
 -- Resolves the /auth/login "email_or_username" field within a project.
 SELECT * FROM users
@@ -22,6 +25,9 @@ LIMIT 1;
 
 -- name: SetUserEmailVerified :exec
 UPDATE users SET email_verified = true WHERE id = $1;
+
+-- name: SetUserPhoneVerified :exec
+UPDATE users SET phone_verified = true WHERE id = $1;
 
 -- name: SetUserPasswordHash :exec
 UPDATE users SET password_hash = $2 WHERE id = $1;

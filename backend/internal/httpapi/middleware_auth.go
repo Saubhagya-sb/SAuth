@@ -14,9 +14,15 @@ import (
 // stashes it on the request context. Every /v1/auth route runs behind this.
 func (s *Server) requireProject(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Header for API calls; ?api_key= for top-level browser navigations
+		// (e.g. the OAuth start redirect) that can't set headers. The publishable
+		// key is safe to expose either way.
 		key := strings.TrimSpace(r.Header.Get("X-API-Key"))
 		if key == "" {
-			writeError(w, r, apierror.Unauthorized("missing X-API-Key header"))
+			key = strings.TrimSpace(r.URL.Query().Get("api_key"))
+		}
+		if key == "" {
+			writeError(w, r, apierror.Unauthorized("missing API key (X-API-Key header or api_key query parameter)"))
 			return
 		}
 		project, err := s.q.GetProjectByAPIKey(r.Context(), key)

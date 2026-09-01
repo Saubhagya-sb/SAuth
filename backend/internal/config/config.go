@@ -15,6 +15,7 @@ type Config struct {
 	HTTPAddr        string
 	Env             string
 	DatabaseURL     string
+	PublicBaseURL   string // externally reachable base URL, for OAuth callbacks
 	JWTSecret       []byte
 	JWTIssuer       string
 	AccessTokenTTL  time.Duration
@@ -28,10 +29,11 @@ func Load() (*Config, error) {
 	_ = godotenv.Load() // best-effort; absent .env is fine
 
 	c := &Config{
-		HTTPAddr:    envOr("SAUTH_HTTP_ADDR", ":8080"),
-		Env:         envOr("SAUTH_ENV", "development"),
-		DatabaseURL: os.Getenv("SAUTH_DATABASE_URL"),
-		JWTIssuer:   envOr("SAUTH_JWT_ISSUER", "sauth"),
+		HTTPAddr:      envOr("SAUTH_HTTP_ADDR", ":8080"),
+		Env:           envOr("SAUTH_ENV", "development"),
+		DatabaseURL:   os.Getenv("SAUTH_DATABASE_URL"),
+		PublicBaseURL: envOr("SAUTH_PUBLIC_BASE_URL", "http://localhost:8080"),
+		JWTIssuer:     envOr("SAUTH_JWT_ISSUER", "sauth"),
 	}
 
 	if c.DatabaseURL == "" {

@@ -13,6 +13,10 @@ import (
 	"github.com/saubhagyabhadhouria/sauth/internal/auth"
 	"github.com/saubhagyabhadhouria/sauth/internal/config"
 	"github.com/saubhagyabhadhouria/sauth/internal/db"
+	"github.com/saubhagyabhadhouria/sauth/internal/googleoauth"
+	"github.com/saubhagyabhadhouria/sauth/internal/notify"
+	"github.com/saubhagyabhadhouria/sauth/internal/otp"
+	"github.com/saubhagyabhadhouria/sauth/internal/secretbox"
 	"github.com/saubhagyabhadhouria/sauth/internal/token"
 )
 
@@ -23,13 +27,50 @@ type Server struct {
 	auth   *auth.Service
 }
 
-func NewServer(pool *pgxpool.Pool, cfg *config.Config) *Server {
+// Option overrides a default dependency (used by tests).
+type Option func(*deps)
+
+type deps struct {
+	otpSender notify.OTPSender
+	google    googleoauth.Provider
+}
+
+// WithOTPSender swaps the OTP transport (e.g. a recording sender in tests).
+func WithOTPSender(s notify.OTPSender) Option {
+	return func(d *deps) { d.otpSender = s }
+}
+
+// WithGoogleOAuth swaps the Google provider (e.g. a fake in tests).
+func WithGoogleOAuth(p googleoauth.Provider) Option {
+	return func(d *deps) { d.google = p }
+}
+
+func NewServer(pool *pgxpool.Pool, cfg *config.Config, opts ...Option) *Server {
+	d := &deps{otpSender: notify.LogSender{}, google: googleoauth.NewClient()}
+	for _, opt := range opts {
+		opt(d)
+	}
+
+	var box *secretbox.Box
+	if len(cfg.EncryptionKey) == 32 {
+		box, _ = secretbox.New(cfg.EncryptionKey)
+	}
+
 	issuer := token.NewIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL)
 	return &Server{
 		pool:   pool,
 		q:      db.New(pool),
 		tokens: issuer,
-		auth:   auth.NewService(pool, issuer, cfg.RefreshTokenTTL),
+		auth: auth.NewService(auth.Deps{
+			Pool:          pool,
+			Tokens:        issuer,
+			OTPHasher:     otp.NewHasher(cfg.JWTSecret),
+			Sender:        d.otpSender,
+			Google:        d.google,
+			SecretBox:     box,
+			PublicBaseURL: cfg.PublicBaseURL,
+			RefreshTTL:    cfg.RefreshTokenTTL,
+		}),
 	}
 }
 

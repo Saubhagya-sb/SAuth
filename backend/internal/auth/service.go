@@ -17,19 +17,50 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/saubhagyabhadhouria/sauth/internal/db"
+	"github.com/saubhagyabhadhouria/sauth/internal/googleoauth"
+	"github.com/saubhagyabhadhouria/sauth/internal/notify"
+	"github.com/saubhagyabhadhouria/sauth/internal/otp"
 	"github.com/saubhagyabhadhouria/sauth/internal/password"
+	"github.com/saubhagyabhadhouria/sauth/internal/secretbox"
 	"github.com/saubhagyabhadhouria/sauth/internal/token"
 )
 
-type Service struct {
-	pool       *pgxpool.Pool
-	q          *db.Queries
-	tokens     *token.Issuer
-	refreshTTL time.Duration
+// Deps are the collaborators the auth service needs.
+type Deps struct {
+	Pool          *pgxpool.Pool
+	Tokens        *token.Issuer
+	OTPHasher     *otp.Hasher
+	Sender        notify.OTPSender
+	Google        googleoauth.Provider
+	SecretBox     *secretbox.Box // nil when no encryption key is configured
+	PublicBaseURL string
+	RefreshTTL    time.Duration
 }
 
-func NewService(pool *pgxpool.Pool, tokens *token.Issuer, refreshTTL time.Duration) *Service {
-	return &Service{pool: pool, q: db.New(pool), tokens: tokens, refreshTTL: refreshTTL}
+type Service struct {
+	pool          *pgxpool.Pool
+	q             *db.Queries
+	tokens        *token.Issuer
+	otpHasher     *otp.Hasher
+	sender        notify.OTPSender
+	google        googleoauth.Provider
+	box           *secretbox.Box
+	publicBaseURL string
+	refreshTTL    time.Duration
+}
+
+func NewService(d Deps) *Service {
+	return &Service{
+		pool:          d.Pool,
+		q:             db.New(d.Pool),
+		tokens:        d.Tokens,
+		otpHasher:     d.OTPHasher,
+		sender:        d.Sender,
+		google:        d.Google,
+		box:           d.SecretBox,
+		publicBaseURL: d.PublicBaseURL,
+		refreshTTL:    d.RefreshTTL,
+	}
 }
 
 // ---------- Signup ----------

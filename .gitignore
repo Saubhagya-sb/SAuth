@@ -1,0 +1,30 @@
+# --- secrets / local config ---
+.env
+.env.local
+*.pem
+*.key
+
+# --- Go ---
+/backend/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+npm-debug.log*
+yarn-error.log*
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
